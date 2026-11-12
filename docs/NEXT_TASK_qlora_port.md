@@ -31,6 +31,24 @@ gradients, no LoRA). The table below sorts them.
 
 Recommended order: **5 → 1 → 3 → 2 → 4**. Profile first, then take the cheap wins, then the big one.
 
+### Status (2026-11-12)
+
+Items 1, 2, 3, 5 and 6 are implemented as an Axolotl plugin, `micro_engram.axolotl_port`. See
+[axolotl_port.md](axolotl_port.md) for config keys and the GPU verification steps. They are
+CPU-tested (`test_axolotl_port.py`) but **not yet run on GPUs or on the owner's patched build**.
+Item 4 is still open.
+
+Found while porting:
+
+- Stock 0.19.0 pads `position_ids` with `range(n_pad)`, not all zeros. The padding is one extra
+  document, not one per pad token. The effect described in item 1 still holds: a padded
+  one-document row counts as packed.
+- `AxolotlTrainer.compute_loss` deletes `attention_mask` for packed Gemma 4 batches. transformers
+  then builds the block mask from `position_ids`, which is the 4D mask that kept packed rows away
+  from the Triton kernel (item 2).
+- Axolotl's CCE fork (`ml-cross-entropy@4dfa522`, `apply_lce`) sums the loss and divides by
+  `num_items_in_batch` when it gets that value, so item 3 also works with CCE.
+
 ---
 
 ## 1. Causal path for one-document rows (global layers)

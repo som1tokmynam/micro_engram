@@ -233,6 +233,8 @@ LoRA/adapters (the base is frozen), an eval split, `fsdp_config.activation_check
 
 The Axolotl plugin this project started as was removed after the new trainer matched it on GPUs; `git checkout axolotl-plugin-final` has its last version.
 
+For ordinary (Q)LoRA SFT in Axolotl, `micro_engram.axolotl_port` is a separate, small plugin that carries this trainer's attention, loss-normalization, profiling and fail-fast fixes over: see [docs/axolotl_port.md](docs/axolotl_port.md).
+
 ---
 
 ## Helper scripts

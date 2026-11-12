@@ -7,7 +7,7 @@ name = "micro-engram"
 version = "0.1.0"
 
 [tool.setuptools]
-packages = ["micro_engram", "micro_engram.train", "micro_engram.train.vendor", "micro_engram_vllm"]
+packages = ["micro_engram", "micro_engram.train", "micro_engram.train.vendor", "micro_engram.axolotl_port", "micro_engram_vllm"]
 
 # Lets vLLM find the plugin automatically once this package is installed.
 [project.entry-points."vllm.general_plugins"]
