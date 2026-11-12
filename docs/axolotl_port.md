@@ -28,6 +28,40 @@ In every version, the plugin hooks run after Axolotl's own setters. Both
 `post_model_build`. From v0.21.0 the collator precomputes FA varlen `cu_seqlens` from the final
 `position_ids`. The plugin pads before that, so `cu_seqlens` already sees the continued padding.
 
+### The owner's server: PR #4180 + the micro_engram engram plugin
+
+PR #4180 only adds CoreWeave `host_paths` mounts. Its base is upstream `cfeff472` (2026-10-18,
+between v0.21.0 and v0.21.1). There, the attention, collator and loss-kwargs modules are identical to
+the latest upstream (`75fe8a1c`), and:
+
+- **Items 1, 2, 5, 6 apply.** Axolotl's two `set_large_head_packed(bool(sample_packing))` calls run
+  before the plugin's `post_model_build`. `compute_loss` still deletes `attention_mask` for packed
+  Gemma 4 batches, so the global layers still get transformers' block mask without item 2. The
+  collator still pads `position_ids` with `range(n)`.
+- **Item 3 is already fixed** (`model_loss_accepts_num_items_in_batch`). Expect
+  `loss normalization: {... 'before': True, 'after': True}`. The plugin changes nothing there.
+- **The engram plugin** (`micro_engram/plugin.py`, tag `axolotl-plugin-final`) patches the optimizer,
+  checkpoint save/resume and the LR scheduler. It doesn't touch attention, masks, the collator or
+  loss kwargs, so there's no overlap. The engram reads `position_ids` only to keep n-grams inside a
+  document (`pos >= i`). With continued padding, pad tokens' n-grams read the last real tokens.
+  That doesn't affect the loss, because pads have no labels and causal attention never shows them
+  to a real token. `micro_engram.train` pads the same way.
+- **Install by copying, not `pip install -e` of this branch.** Current master no longer has
+  `micro_engram/plugin.py`, so installing it over the `axolotl-plugin-final` checkout would remove
+  the engram plugin. `micro_engram/axolotl_port/` only imports numpy, pydantic, Axolotl and its own
+  `patches`, so copy that folder into the server's checkout (editable install, or reinstall). Then
+  list both plugins:
+
+  ```yaml
+  plugins:
+    - micro_engram.MicroEngramPlugin          # as before
+    - micro_engram.axolotl_port.plugin.QLoRAPortPlugin
+  ```
+- **Check that it loaded.** This Axolotl skips a plugin that fails to import, with only a warning
+  (`Could not load plugin ...; skipping it`), and trains on without it. Look for
+  `Plugin loaded successfully: micro_engram.axolotl_port.plugin.QLoRAPortPlugin` and the
+  `[qlora_port] ...` lines at startup.
+
 ## Use
 
 Install this repo in the Axolotl venv (`pip install -e /path/to/micro_engram`), then add to the
