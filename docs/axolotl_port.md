@@ -9,6 +9,25 @@ It patches Axolotl objects that it finds by module and attribute name, at Axolot
 it also works on a patched Axolotl build as long as those names exist. The logic lives in
 `micro_engram/axolotl_port/patches.py` and doesn't import Axolotl. `plugin.py` is the Axolotl glue.
 
+## Axolotl versions
+
+Axolotl's Gemma 4 hybrid-attention work started at upstream commit `b8358aa` (2026-04-12, PR #3598,
+first released in v0.17.0). What each item needs, per upstream history up to v0.21.1 / `75fe8a1c`:
+
+| piece the plugin uses | upstream since | if missing |
+|---|---|---|
+| `sdpa_global_packed` on the global layers | v0.18.0 (before it, they ran plain `sdpa` and needed the model's mask) | item 2 is **skipped** (the plugin counts the layers' attention impl), because dropping the mask would let attention cross packed documents |
+| `large_head.set_large_head_packed` | v0.18.0 (`c35810da`) | item 1's per-call probe is skipped; continued pad positions still apply |
+| `large_head` + `flash_attn_d512` (Triton kernel) | v0.18.0 | no kernel: packed rows use the block mask |
+| pass-through of sliding-mask calls in `gemma4_hybrid_mask` | v0.19.0 (`6e63e060`) | v0.18.x has Axolotl's own FA2-sliding-mask crash on the vision-mask path; the plugin doesn't change it |
+| `gemma4_loss_kwargs` (Gemma 4 declares `accepts_loss_kwargs`) | v0.18.0 | item 3 decides from the Gemma 4 loss signature instead |
+| Trainer no longer forces `model_accepts_loss_kwargs = False` | **v0.20.0** (`e6e8db31`, same diagnosis as item 3) | from v0.20.0, item 3 finds `before: True` and does nothing |
+
+In every version, the plugin hooks run after Axolotl's own setters. Both
+`set_large_head_packed(bool(sample_packing))` calls (pre-model-load and hybrid setup) run before
+`post_model_build`. From v0.21.0 the collator precomputes FA varlen `cu_seqlens` from the final
+`position_ids`. The plugin pads before that, so `cu_seqlens` already sees the continued padding.
+
 ## Use
 
 Install this repo in the Axolotl venv (`pip install -e /path/to/micro_engram`), then add to the

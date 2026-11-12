@@ -52,20 +52,31 @@ class QLoRAPortPlugin(BasePlugin):
                 LOG.warning("[qlora_port] gemma4_hybrid_attn_impl is off: the global-layer fixes (items 1-2) "
                             "need it and are skipped")
         else:
-            large_head = _import("axolotl.monkeypatch.attention.large_head")
-            if large_head is not None and _on(cfg, "qlora_port_dynamic_packing"):
+            # large_head / set_large_head_packed / sdpa_global_packed exist from Axolotl v0.18.0; the
+            # Gemma 4 hybrid work started earlier (b8358aa, v0.17.0) with plain-SDPA global layers.
+            large_head = _import_quiet("axolotl.monkeypatch.attention.large_head")
+            if _on(cfg, "qlora_port_dynamic_packing"):
                 if cfg.get("torch_compile"):
                     LOG.warning("[qlora_port] torch_compile is on: the per-call packing probe is a graph "
                                 "break; set qlora_port_dynamic_packing: false if compile matters more")
-                patches.dynamic_packing_probe(large_head)
-                done.append("global layers probe packing per call")
+                if patches.dynamic_packing_probe(large_head):
+                    done.append("global layers probe packing per call")
+                else:
+                    LOG.warning("[qlora_port] this Axolotl has no large_head.set_large_head_packed "
+                                "(< v0.18.0): item 1's per-call probe skipped")
             if _on(cfg, "qlora_port_unmask_global_layers"):
-                n = sum(bool(m is not None and patches.unmask_global_layers(m))
-                        for m in map(_import_quiet, _GEMMA4_MODULES))
-                if n:
-                    done.append(f"global layers get no model mask ({n} namespace(s))")
+                packed, plain = patches.global_attention_impls(model)
+                if not packed:
+                    LOG.warning("[qlora_port] no attention layer uses '%s' (%d other): the global layers "
+                                "need the model's mask to isolate packed documents, so item 2 is skipped "
+                                "(Axolotl < v0.18.0?)", patches.GLOBAL_PACKED_SDPA, plain)
+                else:
+                    n = sum(bool(m is not None and patches.unmask_global_layers(m))
+                            for m in map(_import_quiet, _GEMMA4_MODULES))
+                    if n:
+                        done.append(f"{packed} global layers get no model mask ({n} namespace(s))")
                 policy = (large_head.get_large_head_policy() if large_head is not None else "?")
-                if policy == "sdpa":
+                if packed and policy == "sdpa":
                     LOG.warning("[qlora_port] large_head_attention is 'sdpa': packed rows on the global "
                                 "layers use the block mask, not the Triton kernel. Set "
                                 "large_head_attention: auto for item 2.")

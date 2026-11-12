@@ -132,6 +132,9 @@ def test_global_layers():
 
     ref = loss(pos_stock)  # plain SDPA everywhere; transformers builds the packed mask from position_ids
 
+    check("impl count: plain-SDPA global layers (Axolotl < v0.18.0) are not packing-aware -> item 2 skipped",
+          patches.global_attention_impls(m) == (0, 4), patches.global_attention_impls(m))
+    check("dynamic probe: no setter (Axolotl < v0.18.0) -> skipped", not patches.dynamic_packing_probe(types.ModuleType("x")))
     # Axolotl's hybrid setup (gemma4_hybrid_attn_impl), then the port on top
     hm.patch_gemma4_hybrid_mask()
     for layer, t in zip(m.model.layers, m.config.layer_types):
@@ -139,6 +142,8 @@ def test_global_layers():
             c = copy.copy(layer.self_attn.config)
             c._attn_implementation = hm.GLOBAL_PACKED_SDPA
             layer.self_attn.config = c
+    check("impl count: the 2 global layers on sdpa_global_packed", patches.global_attention_impls(m) == (2, 2),
+          patches.global_attention_impls(m))
     lh.set_large_head_packed(True)  # what Axolotl declares under sample_packing
     patches.dynamic_packing_probe(lh)
     check("dynamic probe: packing no longer declared", lh._PACKED is None)
@@ -263,13 +268,26 @@ def test_loss_normalization():
     check("loss kwargs: Axolotl's override gives a different (per-micro-batch mean) gradient", rel(g_ax) > 0.05,
           rel(g_ax))
 
-    class NoDecl(Gemma4ForCausalLM):
-        accepts_loss_kwargs = False
+    def fake_trainer(model):
+        return types.SimpleNamespace(model=model, accelerator=types.SimpleNamespace(unwrap_model=lambda x: x),
+                                     model_accepts_loss_kwargs=False, compute_loss_func=None,
+                                     args=types.SimpleNamespace(average_tokens_across_devices=True))
 
-    fake = types.SimpleNamespace(model=NoDecl(base.config), accelerator=types.SimpleNamespace(unwrap_model=lambda x: x),
-                                 model_accepts_loss_kwargs=False, compute_loss_func=None,
-                                 args=types.SimpleNamespace(average_tokens_across_devices=True))
-    check("loss kwargs: left off when the model class doesn't declare them", not patches.token_normalized_loss(fake)["after"])
+    class Gemma4PreV018(Gemma4ForCausalLM):
+        accepts_loss_kwargs = False  # PaliGemma's flag, before Axolotl v0.18.0's gemma4_loss_kwargs patch
+
+    check("loss kwargs: Gemma 4 without Axolotl's declaration (< v0.18.0) is turned on from its loss signature",
+          patches.token_normalized_loss(fake_trainer(Gemma4PreV018(base.config)))["after"])
+
+    class Other(torch.nn.Module):
+        accepts_loss_kwargs = False
+        config = types.SimpleNamespace(model_type="paligemma")
+
+        def loss_function(self, logits, labels, num_items_in_batch=None):
+            pass
+
+    check("loss kwargs: left off for a non-Gemma 4 model that declares False",
+          not patches.token_normalized_loss(fake_trainer(Other()))["after"])
 
 
 # ----------------------------------------------------------------------------- 4. profiler

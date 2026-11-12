@@ -46,6 +46,10 @@ Found while porting:
 - `AxolotlTrainer.compute_loss` deletes `attention_mask` for packed Gemma 4 batches. transformers
   then builds the block mask from `position_ids`, which is the 4D mask that kept packed rows away
   from the Triton kernel (item 2).
+- Upstream Axolotl fixed item 3 itself in v0.20.0 (`e6e8db31`). The Gemma 4 hybrid work started at
+  `b8358aa` (v0.17.0), and the global layers' packing-aware impl only arrived in v0.18.0. See the
+  version table in [axolotl_port.md](axolotl_port.md). The plugin skips what an older build can't
+  support safely.
 - Axolotl's CCE fork (`ml-cross-entropy@4dfa522`, `apply_lce`) sums the loss and divides by
   `num_items_in_batch` when it gets that value, so item 3 also works with CCE.
 

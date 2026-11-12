@@ -83,8 +83,37 @@ def dynamic_packing_probe(large_head):
     holds several documents, instead of Axolotl's ``bool(sample_packing)``, which declared every row
     packed and forced an S x S block mask (no causal skip, ~2x the work) on one-document rows too.
     Costs one tiny GPU sync per global layer per forward; incompatible with torch.compile's
-    fullgraph (a data-dependent branch), which Axolotl only wanted to avoid for that."""
-    large_head.set_large_head_packed(None)
+    fullgraph (a data-dependent branch), which Axolotl only wanted to avoid for that.
+
+    Returns False when this Axolotl has no such setter (before v0.18.0)."""
+    setter = getattr(large_head, "set_large_head_packed", None)
+    if setter is None:
+        return False
+    setter(None)
+    return True
+
+
+# Axolotl's packing-aware attention for the Gemma 4 global layers (v0.18.0+). Before it (the hybrid
+# work started at b8358aa, v0.17.0) those layers ran plain "sdpa" and relied on the model's mask.
+GLOBAL_PACKED_SDPA = "sdpa_global_packed"
+
+
+def global_attention_impls(model):
+    """(number of attention modules on GLOBAL_PACKED_SDPA, number on anything else), read from each
+    ``self_attn.config._attn_implementation``. Item 2 is only safe when the first is > 0: dropping the
+    model mask from plain-SDPA global layers would let them attend across packed documents."""
+    packed = other = 0
+    if model is None:
+        return packed, other
+    for name, mod in model.named_modules():
+        if not name.endswith("self_attn"):
+            continue
+        impl = getattr(getattr(mod, "config", None), "_attn_implementation", None)
+        if impl == GLOBAL_PACKED_SDPA:
+            packed += 1
+        else:
+            other += 1
+    return packed, other
 
 
 # ----------------------------------------------------------------------------- item 2: unmasked globals
@@ -167,6 +196,16 @@ def _unwrap(trainer):
     return m
 
 
+def _loss_takes_num_items(model):
+    import inspect
+
+    fn = getattr(model, "loss_function", None)
+    try:
+        return fn is not None and "num_items_in_batch" in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def token_normalized_loss(trainer):
     """Undo ``AxolotlTrainer.__init__``'s ``model_accepts_loss_kwargs = False`` when the model class
     explicitly declares ``accepts_loss_kwargs = True`` (Axolotl's own gemma4_loss_kwargs patch sets
@@ -189,7 +228,12 @@ def token_normalized_loss(trainer):
         "average_tokens_across_devices": bool(getattr(trainer.args, "average_tokens_across_devices", False)),
         "compute_loss_func": trainer.compute_loss_func is not None,
     }
-    if declared is True and not trainer.model_accepts_loss_kwargs and trainer.compute_loss_func is None:
+    # Before Axolotl v0.18.0 (no gemma4_loss_kwargs patch) Gemma 4 still declares False, inherited
+    # from PaliGemma; its loss is the stock ForCausalLMLoss, so decide from the loss signature.
+    gemma4 = getattr(getattr(m, "config", None), "model_type", None) in ("gemma4", "gemma4_unified", "gemma4_text")
+    info["loss_takes_num_items"] = _loss_takes_num_items(m)
+    ok = declared is True or (gemma4 and info["loss_takes_num_items"])
+    if ok and not trainer.model_accepts_loss_kwargs and trainer.compute_loss_func is None:
         trainer.model_accepts_loss_kwargs = True
     info["after"] = bool(trainer.model_accepts_loss_kwargs)
     return info
