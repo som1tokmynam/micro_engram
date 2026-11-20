@@ -19,3 +19,5 @@ class QLoRAPortArgs(BaseModel):
     qlora_port_token_loss: Optional[bool] = True
     # item 6: a failing rank prints its traceback and exits instead of hanging in NCCL.
     qlora_port_fail_fast: Optional[bool] = True
+    # Ricursive (remote code): packed rows on FlashAttention-2 varlen, documents isolated.
+    qlora_port_ricursive_varlen: Optional[bool] = True

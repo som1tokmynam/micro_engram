@@ -62,6 +62,51 @@ the latest upstream (`75fe8a1c`), and:
   `Plugin loaded successfully: micro_engram.axolotl_port.plugin.QLoRAPortPlugin` and the
   `[qlora_port] ...` lines at startup.
 
+## Ricursive (remote code, `model_type: ricursive`)
+
+The checkpoint's `modeling_ricursive.py` was written for inference and has three problems for
+packed training:
+- Its attention always calls SDPA and builds masks only from `attention_mask`. With sample packing,
+  every document attends to the previous ones, silently. Axolotl only warns, and its warning
+  assumes SDPA keeps packed samples apart.
+- The 64 sliding layers compute full S×S attention instead of a 1024 window.
+- `RIPPLE_MLP_CHUNK` row chunking dequantizes the 4-bit MLP weights again for every chunk.
+
+`micro_engram/axolotl_port/ricursive.py` (`qlora_port_ricursive_varlen`, default on, applied by the
+same plugin) fixes the first two:
+- Training forwards with `position_ids` run FlashAttention 2 varlen: one segment per document,
+  causal, window 1023 on the sliding layers, GQA native.
+- The model's own projections, Q/K norms, RoPE, value residual and output gate are kept.
+- Generation, cached decoding, left padding and batches without `position_ids` run the original
+  code. A training batch without `position_ids` logs a warning once.
+- The plugin sets `RIPPLE_MLP_CHUNK=0` unless you set it.
+
+```yaml
+base_model: /path/to/ricursive
+trust_remote_code: true
+attn_implementation: sdpa   # transformers refuses flash_attention_2 for this remote class; the patch calls flash-attn itself
+sample_packing: true
+plugins:
+  - micro_engram.axolotl_port.plugin.QLoRAPortPlugin
+```
+
+Startup log: `[qlora_port] ricursive: 80 attention modules on FlashAttention-2 varlen for packed rows`.
+`flash-attn` must be installed, or packed rows fall back to a slow per-document path (with a
+warning).
+
+Test: `RICURSIVE_MODEL_DIR=<folder with modeling_ricursive.py + configuration_ricursive.py> python test_ricursive_port.py`.
+On CPU it checks a tiny model:
+- packed rows give each document the hidden states, loss and gradients it gets alone (sliding
+  window binding, gradient checkpointing);
+- the original model leaks (control);
+- the fallbacks are unchanged.
+
+On a GPU with flash-attn it also checks the FA2 kernel against the reference (bf16, forward and
+backward, with and without the window).
+
+Still open: the loss builds full `[S, 100352]` logits plus an fp32 copy (about 8 GB at 8k tokens). A
+chunked loss is the next step.
+
 ## Use
 
 Install this repo in the Axolotl venv (`pip install -e /path/to/micro_engram`), then add to the

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import os
 
 from axolotl.integrations.base import BasePlugin
 
@@ -47,8 +48,23 @@ class QLoRAPortPlugin(BasePlugin):
                 done.append("collator: " + ", ".join(
                     s for s, on in (("pads continue position_ids", pad),
                                     ("no cross-document targets", mask)) if on))
+        if _on(cfg, "qlora_port_ricursive_varlen") and model is not None:
+            from . import ricursive
+
+            n = ricursive.patch_ricursive_varlen(model)
+            if n:
+                done.append(f"ricursive: {n} attention modules on FlashAttention-2 varlen for packed rows")
+                if ricursive._flash_varlen() is None:
+                    LOG.warning("[qlora_port] ricursive: flash-attn is not importable; packed rows use the "
+                                "slow per-document reference")
+                if os.environ.get("RIPPLE_MLP_CHUNK") is None:
+                    # the model's inference-time MLP row chunking re-dequantizes the 4-bit MLP weights
+                    # per chunk in training and saves no activation memory under autograd
+                    os.environ["RIPPLE_MLP_CHUNK"] = "0"
+                    done.append("ricursive: RIPPLE_MLP_CHUNK=0")
         if not cfg.get("gemma4_hybrid_attn_impl"):
-            if _on(cfg, "qlora_port_dynamic_packing") or _on(cfg, "qlora_port_unmask_global_layers"):
+            if (_on(cfg, "qlora_port_dynamic_packing") or _on(cfg, "qlora_port_unmask_global_layers")) \
+                    and not _is_ricursive(model):
                 LOG.warning("[qlora_port] gemma4_hybrid_attn_impl is off: the global-layer fixes (items 1-2) "
                             "need it and are skipped")
         else:
@@ -105,6 +121,10 @@ class QLoRAPortPlugin(BasePlugin):
         from transformers import TrainerCallback
 
         return [patches.profiler_callback(int(step), trainer.args.output_dir, TrainerCallback)]
+
+
+def _is_ricursive(model):
+    return getattr(getattr(model, "config", None), "model_type", None) == "ricursive"
 
 
 def _import_quiet(name):
