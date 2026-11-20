@@ -21,3 +21,5 @@ class QLoRAPortArgs(BaseModel):
     qlora_port_fail_fast: Optional[bool] = True
     # Ricursive (remote code): packed rows on FlashAttention-2 varlen, documents isolated.
     qlora_port_ricursive_varlen: Optional[bool] = True
+    # Ricursive: training loss over chunks of this many tokens (no full [S, vocab] logits). 0 = off.
+    qlora_port_ricursive_loss_chunk: Optional[int] = 1024

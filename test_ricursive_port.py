@@ -184,8 +184,55 @@ def main():
     check("cached decoding: original path, matches a full forward",
           float((nxt.logits[0, -1] - full.logits[0, -1]).abs().max()) < 1e-4)
 
+    test_chunked_loss(cm, mm, ids, pos_cont, labels, count)
     print(f"\n{'ALL PASSED' if not FAIL else f'{len(FAIL)} FAILED: {FAIL}'}")
     sys.exit(1 if FAIL else 0)
+
+
+def test_chunked_loss(cm, mm, ids, pos, labels, count):
+    """6. chunked loss == the model's full-logits loss (value + every gradient), lm_head never sees
+    more than `chunk` rows, eval keeps logits."""
+    ref_m = tiny(cm, mm)  # same seed -> same weights; varlen patch already on these classes
+    ids2 = torch.cat([ids, ids.flip(1)])
+    pos2 = torch.cat([pos, pos])
+    lab2 = torch.cat([labels, ids.flip(1)])
+    res = {}
+    for name, nitems in (("sum / num_items", count + lab2.shape[1] - 1), ("mean", None)):
+        ref_m.train()
+        ref_m.zero_grad()
+        cls = type(ref_m)
+        fwd = cls.forward
+        orig = getattr(fwd, "_me_original", fwd)
+        kw = dict(input_ids=ids2, position_ids=pos2, labels=lab2, use_cache=False)
+        if nitems is not None:
+            kw["num_items_in_batch"] = nitems
+        loss_r = orig(ref_m, **kw).loss
+        loss_r.backward()
+        g_r = {k: p.grad.clone() for k, p in ref_m.named_parameters() if p.grad is not None}
+        res[name] = (loss_r, g_r, kw)
+    ok = R.patch_ricursive_chunked_loss(ref_m, chunk=5)
+    check("chunked loss: patched", ok and R.patch_ricursive_chunked_loss(ref_m, chunk=5))
+    rows = []
+    hook = ref_m.lm_head.register_forward_hook(lambda mod, inp, out: rows.append(inp[0].shape[0]))
+    for name, (loss_r, g_r, kw) in res.items():
+        ref_m.zero_grad()
+        rows.clear()
+        out = ref_m(**kw)
+        out.loss.backward()
+        g_c = {k: p.grad.clone() for k, p in ref_m.named_parameters() if p.grad is not None}
+        gd = max(float((g_c[k] - g_r[k]).abs().max() / (g_r[k].abs().max() + 1e-12)) for k in g_r)
+        check(f"chunked loss ({name}): value == full-logits loss",
+              abs(float(out.loss.detach()) - float(loss_r.detach())) < 1e-5,
+              f"{float(out.loss.detach())} vs {float(loss_r.detach())}")
+        check(f"chunked loss ({name}): every gradient == full-logits loss", set(g_c) == set(g_r) and gd < 1e-4, gd)
+        check(f"chunked loss ({name}): lm_head never sees more than 5 rows (forward + backward recompute)",
+              rows and max(rows) <= 5 and out.logits is None, (max(rows) if rows else None))
+    hook.remove()
+    ref_m.eval()
+    with torch.no_grad():
+        ev = ref_m(input_ids=ids2, position_ids=pos2, labels=lab2, use_cache=False)
+    check("chunked loss: eval keeps the original forward (logits returned)",
+          ev.logits is not None and ev.logits.shape[-1] == 50)
 
 
 if __name__ == "__main__":

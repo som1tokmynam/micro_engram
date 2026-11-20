@@ -104,8 +104,22 @@ On CPU it checks a tiny model:
 On a GPU with flash-attn it also checks the FA2 kernel against the reference (bf16, forward and
 backward, with and without the window).
 
-Still open: the loss builds full `[S, 100352]` logits plus an fp32 copy (about 8 GB at 8k tokens). A
-chunked loss is the next step.
+**Chunked loss** (`qlora_port_ricursive_loss_chunk`, default 1024; `0` turns it off): the model's
+loss builds the full `[S, 100352]` logits, an fp32 copy and an fp32 gradient, about 8 GB at 8k
+tokens. In training with labels, the patched forward computes the loss 1024 tokens at a time
+instead, about 1 GB at most.
+- Each chunk is checkpointed, so only one chunk's logits exist, in forward and in backward.
+- Every chunk goes through `self.lm_head(...)`, so PEFT/bnb/FSDP hooks still apply.
+- The math is the same as the model's: bf16 `lm_head`, then fp32, then `cross_entropy`, with
+  `sum / num_items_in_batch` or `mean`.
+- It returns `logits=None`, which the Trainer doesn't need for the training loss.
+- Eval, generation and calls asking for logits use the original forward.
+- If `lm_head` is its own FSDP unit, the plugin falls back to the full loss with a warning: a
+  different chunk count per rank could otherwise hang NCCL. In Axolotl, `lm_head` sits in the root
+  unit.
+
+The CPU test checks the loss value and every gradient (lm_head included) against the full-logits
+loss, and that `lm_head` never sees more than one chunk.
 
 ## Use
 

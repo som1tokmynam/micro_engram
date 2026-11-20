@@ -62,6 +62,13 @@ class QLoRAPortPlugin(BasePlugin):
                     # per chunk in training and saves no activation memory under autograd
                     os.environ["RIPPLE_MLP_CHUNK"] = "0"
                     done.append("ricursive: RIPPLE_MLP_CHUNK=0")
+        if model is not None and _is_ricursive(model):
+            from . import ricursive
+
+            chunk = cfg.get("qlora_port_ricursive_loss_chunk")
+            chunk = 1024 if chunk is None else int(chunk)
+            if chunk > 0 and ricursive.patch_ricursive_chunked_loss(model, chunk):
+                done.append(f"ricursive: training loss in {chunk}-token chunks (no full logits)")
         if not cfg.get("gemma4_hybrid_attn_impl"):
             if (_on(cfg, "qlora_port_dynamic_packing") or _on(cfg, "qlora_port_unmask_global_layers")) \
                     and not _is_ricursive(model):

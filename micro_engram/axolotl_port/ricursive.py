@@ -170,6 +170,88 @@ def _model_forward(orig):
     return forward
 
 
+# ----------------------------------------------------------------------------- chunked loss
+_MODEL_KEYS = ("input_ids", "attention_mask", "position_ids", "past_key_values", "inputs_embeds", "use_cache",
+               "output_attentions", "output_hidden_states", "cache_position")
+
+
+def _is_fsdp_unit(module):
+    try:
+        from torch.distributed.fsdp import FSDPModule
+    except Exception:  # noqa: BLE001
+        return False
+    return isinstance(module, FSDPModule)
+
+
+def chunked_lm_loss(lm_head, hidden, labels, chunk):
+    """Sum of the causal-LM token losses (labels shifted inside each row, -100 ignored), computed
+    ``chunk`` tokens at a time. Each chunk is checkpointed: only one chunk's [chunk, vocab] logits
+    exist at once, in forward and in backward. Same math as the model's loss: ``lm_head`` in the
+    hidden dtype, then fp32, then cross_entropy(sum)."""
+    from torch.utils.checkpoint import checkpoint
+
+    B, S, H = hidden.shape
+    shifted = torch.full_like(labels, -100)
+    shifted[:, :-1] = labels[:, 1:]
+    h = hidden.reshape(B * S, H)
+    t = shifted.reshape(B * S).to(hidden.device)
+
+    def part(hc, tc):
+        logits = lm_head(hc).float()
+        return F.cross_entropy(logits, tc, ignore_index=-100, reduction="sum")
+
+    total = hidden.new_zeros((), dtype=torch.float32)
+    # every chunk runs, even with no labels: the same number of lm_head calls on every rank
+    for s in range(0, B * S, chunk):
+        total = total + checkpoint(part, h[s:s + chunk], t[s:s + chunk], use_reentrant=False)
+    return total, (t != -100).sum()
+
+
+def _causal_lm_forward(orig, chunk):
+    def forward(self, *args, **kwargs):
+        labels = kwargs.get("labels")
+        if (args or labels is None or not self.training or kwargs.get("logits_to_keep")
+                or kwargs.get("past_key_values") is not None or kwargs.get("output_attentions")
+                or kwargs.get("output_hidden_states")):
+            return orig(self, *args, **kwargs)
+        if _is_fsdp_unit(self.lm_head):
+            if not _WARNED.get("fsdp_head"):
+                _WARNED["fsdp_head"] = True
+                LOG.warning("[qlora_port] ricursive: lm_head is its own FSDP unit; chunked loss off (a different "
+                            "chunk count per rank could hang), using the model's full-logits loss")
+            return orig(self, *args, **kwargs)
+        from transformers.modeling_outputs import CausalLMOutputWithPast
+
+        num_items = kwargs.get("num_items_in_batch")
+        rest = {k: v for k, v in kwargs.items()
+                if k not in _MODEL_KEYS + ("labels", "num_items_in_batch", "return_dict", "logits_to_keep")}
+        model_kw = {k: kwargs[k] for k in _MODEL_KEYS if k in kwargs}
+        out = self.model(**model_kw, return_dict=True, **rest)
+        total, count = chunked_lm_loss(self.lm_head, out.last_hidden_state, labels, chunk)
+        if num_items is not None:
+            loss = total / torch.as_tensor(num_items, device=total.device)
+        else:
+            loss = total / count  # the model's reduction="mean" (NaN with no labels, as there)
+        return CausalLMOutputWithPast(loss=loss, logits=None, past_key_values=None)
+
+    forward._me_chunked = True
+    forward._me_original = orig
+    return forward
+
+
+def patch_ricursive_chunked_loss(model, chunk=1024):
+    """Training forwards with labels compute the loss in ``chunk``-token pieces (see
+    chunked_lm_loss) and return ``logits=None``. Eval, generation and any call asking for logits
+    keep the original. Returns True when patched (idempotent)."""
+    for mod in model.modules():
+        if type(mod).__name__ == "RicursiveForCausalLM":
+            cls = type(mod)
+            if not getattr(cls.forward, "_me_chunked", False):
+                cls.forward = _causal_lm_forward(cls.forward, int(chunk))
+            return True
+    return False
+
+
 def patch_ricursive_varlen(model):
     """Patch the Ricursive classes found on ``model`` (idempotent). Returns the number of attention
     modules now on the varlen path (0: not a Ricursive model)."""
