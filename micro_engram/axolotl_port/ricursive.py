@@ -282,6 +282,33 @@ def patch_ricursive_fused_mlp(model):
     return n
 
 
+def patch_ricursive_fused_rmsnorm(model):
+    """``RicursiveRMSNorm.forward`` -> one fused Triton kernel forward and backward
+    (ricursive_kernels.rms_norm: same math incl. the model's cast back to the input dtype before
+    the weight; frozen weights only, else the model's code). Returns the number of norms
+    (layer norms + per-head Q/K norms + final norm) patched (idempotent)."""
+    from .ricursive_kernels import rms_norm
+
+    cls, n = None, 0
+    for mod in model.modules():
+        if type(mod).__name__ == "RicursiveRMSNorm":
+            cls = type(mod)
+            n += 1
+    if cls is None:
+        return 0
+    if getattr(cls.forward, "_me_fused", False):
+        return n
+    orig = cls.forward
+
+    def forward(self, hidden_states):
+        return rms_norm(hidden_states, self.weight, self.eps)
+
+    forward._me_fused = True
+    forward._me_original = orig
+    cls.forward = forward
+    return n
+
+
 def patch_ricursive_varlen(model):
     """Patch the Ricursive classes found on ``model`` (idempotent). Returns the number of attention
     modules now on the varlen path (0: not a Ricursive model)."""

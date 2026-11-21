@@ -130,7 +130,31 @@ elementwise work was ~30% of compute in the step profile.
 - The projections stay module calls (LoRA / bnb / FSDP).
 - Without CUDA or Triton, the original ops run.
 
-`python test_ricursive_mlp.py`:
+**Fused RMSNorm** (`qlora_port_ricursive_fused_rmsnorm`, default on):
+- One Triton program per row, forward and backward, replacing the fp32 upcast, `pow`, `mean`,
+  `rsqrt`, cast back and weight multiply.
+- The math is the model's, including the cast to the input dtype before the weight multiply and
+  fp32 output promotion when the weight is fp32.
+- It covers the 4 norms per layer, the per-head Q/K norms and the final norm.
+- Frozen weights only (as under LoRA). A trainable norm weight uses the model's code.
+
+**Fused LoRA** (`qlora_port_fused_lora`, default on, any model with `adapter: lora/qlora`):
+- PEFT's 4-bit LoRA forward clones the base output, then does `+ lora_B(lora_A(x)) * scaling` as
+  separate full-size passes, plus `grad * scaling` in backward.
+- The patch runs the base matmul on the flattened input, then `result.addmm_(lora_A(x), Bᵀ,
+  alpha=scaling)`: cuBLAS adds the scaled low-rank product in its epilogue.
+- It falls back to PEFT's code for:
+  - adapters in a different dtype than the input;
+  - dropout active in training;
+  - several adapters or variants (DoRA), lora bias;
+  - merged or disabled adapters;
+  - autocast.
+- After the first 200 LoRA calls the log shows how many took the fast path:
+  `[qlora_port] fused LoRA: N of the first 200 …`.
+- `python test_lora_fused.py` (CPU) checks it against PEFT, including every fallback. In bf16 it
+  is more accurate than PEFT's own path (one rounding instead of three).
+
+`python test_ricursive_mlp.py` (fused MLP and RMSNorm):
 - **CPU:** runs the kernels through Triton's interpreter. Forward and both gradients match the
   model's ops (fp32, clamps binding, no-clamp case). With `RICURSIVE_MODEL_DIR` it also checks
   that loss and every gradient of a tiny model are unchanged (with gradient checkpointing).

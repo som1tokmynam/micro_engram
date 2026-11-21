@@ -54,9 +54,84 @@ try:  # pragma: no cover - import guarded for machines without Triton
         tl.store(dg_ptr + offs, dg.to(dg_ptr.dtype.element_ty), mask=m)
         tl.store(du_ptr + offs, du.to(du_ptr.dtype.element_ty), mask=m)
 
+    @triton.jit
+    def _rms_fwd_kernel(x_ptr, w_ptr, y_ptr, rstd_ptr, D, eps, BLOCK: tl.constexpr):
+        row = tl.program_id(0).to(tl.int64)
+        cols = tl.arange(0, BLOCK)
+        m = cols < D
+        x = tl.load(x_ptr + row * D + cols, mask=m, other=0.0).to(tl.float32)
+        rstd = 1.0 / tl.sqrt(tl.sum(x * x, axis=0) / D + eps)
+        # the model: weight * (x * rstd).to(input dtype)
+        xn = (x * rstd).to(x_ptr.dtype.element_ty).to(tl.float32)
+        w = tl.load(w_ptr + cols, mask=m, other=0.0).to(tl.float32)
+        tl.store(y_ptr + row * D + cols, (w * xn).to(y_ptr.dtype.element_ty), mask=m)
+        tl.store(rstd_ptr + row, rstd)
+
+    @triton.jit
+    def _rms_bwd_kernel(dy_ptr, x_ptr, w_ptr, rstd_ptr, dx_ptr, D, BLOCK: tl.constexpr):
+        row = tl.program_id(0).to(tl.int64)
+        cols = tl.arange(0, BLOCK)
+        m = cols < D
+        dy = tl.load(dy_ptr + row * D + cols, mask=m, other=0.0).to(tl.float32)
+        x = tl.load(x_ptr + row * D + cols, mask=m, other=0.0).to(tl.float32)
+        w = tl.load(w_ptr + cols, mask=m, other=0.0).to(tl.float32)
+        rstd = tl.load(rstd_ptr + row)
+        xn = x * rstd
+        g = dy * w  # gradient w.r.t. the normalized x (the dtype cast passes it straight through)
+        dx = rstd * (g - xn * (tl.sum(g * xn, axis=0) / D))
+        tl.store(dx_ptr + row * D + cols, dx.to(dx_ptr.dtype.element_ty), mask=m)
+
     _HAVE_TRITON = True
 except Exception:  # noqa: BLE001
     _HAVE_TRITON = False
+
+
+def _rms_warps(block):
+    return 16 if block >= 8192 else 8 if block >= 2048 else 4
+
+
+class _RMSNorm(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, w, eps):
+        shape = x.shape
+        D = shape[-1]
+        x2 = x.reshape(-1, D).contiguous()
+        rows = x2.shape[0]
+        y = torch.empty((rows, D), dtype=torch.promote_types(w.dtype, x.dtype), device=x.device)
+        rstd = torch.empty(rows, dtype=torch.float32, device=x.device)
+        block = triton.next_power_of_2(D)
+        _rms_fwd_kernel[(rows,)](x2, w.contiguous(), y, rstd, D, float(eps), BLOCK=block,
+                                 num_warps=_rms_warps(block))
+        ctx.save_for_backward(x2, w, rstd)
+        ctx.shape = shape
+        return y.view(shape)
+
+    @staticmethod
+    def backward(ctx, dy):
+        x2, w, rstd = ctx.saved_tensors
+        D = x2.shape[-1]
+        dy2 = dy.reshape(-1, D).contiguous()
+        dx = torch.empty_like(x2)
+        block = triton.next_power_of_2(D)
+        _rms_bwd_kernel[(x2.shape[0],)](dy2, x2, w.contiguous(), rstd, dx, D, BLOCK=block,
+                                        num_warps=_rms_warps(block))
+        return dx.view(ctx.shape), None, None
+
+
+def rms_norm_reference(x, weight, eps):
+    """RicursiveRMSNorm.forward."""
+    input_dtype = x.dtype
+    xf = x.float()
+    xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
+    return weight * xf.to(input_dtype)
+
+
+def rms_norm(x, weight, eps):
+    """The model's RMSNorm, fused when possible (frozen weight, Triton available, D <= 65536)."""
+    if (weight.requires_grad or not fused_available(x) or x.dim() == 0 or x.numel() == 0
+            or x.shape[-1] > 65536 or weight.shape != x.shape[-1:]):
+        return rms_norm_reference(x, weight, eps)
+    return _RMSNorm.apply(x, weight, eps)
 
 
 def _grid(n):

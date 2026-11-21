@@ -73,6 +73,16 @@ class QLoRAPortPlugin(BasePlugin):
                 n = ricursive.patch_ricursive_fused_mlp(model)
                 if n:
                     done.append(f"ricursive: fused clamp-SiLU-mul in {n} MLPs")
+            if _on(cfg, "qlora_port_ricursive_fused_rmsnorm"):
+                n = ricursive.patch_ricursive_fused_rmsnorm(model)
+                if n:
+                    done.append(f"ricursive: fused RMSNorm in {n} norms")
+        if _on(cfg, "qlora_port_fused_lora") and cfg.get("adapter") in ("lora", "qlora"):
+            from . import lora_fused
+
+            names = lora_fused.patch_fused_lora()
+            if names:
+                done.append("fused LoRA scale+add (addmm) on " + ", ".join(names))
         if not cfg.get("gemma4_hybrid_attn_impl"):
             if (_on(cfg, "qlora_port_dynamic_packing") or _on(cfg, "qlora_port_unmask_global_layers")) \
                     and not _is_ricursive(model):

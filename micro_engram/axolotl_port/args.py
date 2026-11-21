@@ -25,3 +25,7 @@ class QLoRAPortArgs(BaseModel):
     qlora_port_ricursive_loss_chunk: Optional[int] = 1024
     # Ricursive: clamp -> silu -> mul of the MLP as one fused Triton kernel (fwd + bwd).
     qlora_port_ricursive_fused_mlp: Optional[bool] = True
+    # Any model: PEFT LoRA's "* scaling" and "+ result" folded into one addmm (no clone/mul/add passes).
+    qlora_port_fused_lora: Optional[bool] = True
+    # Ricursive: RMSNorm (layer norms + per-head Q/K norms) as one fused Triton kernel (fwd + bwd).
+    qlora_port_ricursive_fused_rmsnorm: Optional[bool] = True

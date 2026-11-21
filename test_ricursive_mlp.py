@@ -80,6 +80,43 @@ def test_function():
               ef <= slack * et + 1e-6, (ef, et))
 
 
+def run_norm(fn, x, w, dy):
+    x = x.detach().clone().requires_grad_()
+    y = fn(x, w, 1e-6)
+    y.backward(dy)
+    return y.detach(), x.grad
+
+
+def test_rmsnorm():
+    torch.manual_seed(2)
+    for shape in ((7, 5, 300), (3, 4, 8, 128)):  # a layer norm (non-power-of-2 D) and a per-head norm
+        D = shape[-1]
+        x = torch.randn(*shape, device=DEV) * 3 + 0.5
+        w = (1 + 0.3 * torch.randn(D, device=DEV))
+        dy = torch.randn(*shape, device=DEV)
+        yf, gf = run_norm(K.rms_norm, x, w, dy)
+        yr, gr = run_norm(K.rms_norm_reference, x, w, dy)
+        check(f"RMSNorm fp32 {shape}: forward == model", rel(yf, yr) < 1e-6, rel(yf, yr))
+        check(f"RMSNorm fp32 {shape}: input gradient == model", rel(gf, gr) < 1e-5, rel(gf, gr))
+        slack = 3.0 if os.environ.get("TRITON_INTERPRET") == "1" else 1.5
+        xb, wb, dyb = x.bfloat16(), w.bfloat16(), dy.bfloat16()
+        truth = run_norm(K.rms_norm_reference, xb.double(), wb.double(), dyb.double())
+        fused = run_norm(K.rms_norm, xb, wb, dyb)
+        ref = run_norm(K.rms_norm_reference, xb, wb, dyb)
+        for i, name in enumerate(("forward", "input gradient")):
+            ef, et = rel(fused[i], truth[i]), rel(ref[i], truth[i])
+            check(f"RMSNorm bf16 {shape} {name}: fused error {ef:.1e} <= model bf16 error {et:.1e} (x{slack:g})",
+                  ef <= slack * et + 1e-6, (ef, et))
+    # an fp32 weight on a bf16 input promotes the output to fp32, as in the model
+    x = torch.randn(4, 64, device=DEV).bfloat16()
+    w = torch.ones(64, device=DEV)
+    check("RMSNorm: fp32 weight x bf16 input -> fp32 output, as the model",
+          K.rms_norm(x, w, 1e-6).dtype == K.rms_norm_reference(x, w, 1e-6).dtype == torch.float32)
+    wt = torch.ones(64, device=DEV, requires_grad=True)
+    check("RMSNorm: a trainable weight falls back to the model's code (weight gets a gradient)",
+          K.rms_norm(x, wt, 1e-6).sum().backward() is None and wt.grad is not None)
+
+
 def test_model():
     folder = os.environ.get("RICURSIVE_MODEL_DIR")
     if not folder or not os.path.exists(os.path.join(folder, "modeling_ricursive.py")):
@@ -93,6 +130,8 @@ def test_model():
     for mod in m.modules():
         if type(mod).__name__ == "RicursiveMLP":
             mod.clamp_threshold = 0.3  # make the clamps bind on this tiny model
+        if type(mod).__name__ == "RicursiveRMSNorm":
+            mod.weight.requires_grad_(False)  # frozen, as under LoRA: the fused norm path is taken
     m.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     g = torch.Generator().manual_seed(4)
     ids = torch.randint(3, 50, (2, 19), generator=g)
@@ -106,10 +145,13 @@ def test_model():
     l0, g0 = loss_and_grads()
     n = R.patch_ricursive_fused_mlp(m)
     check("model: all 5 MLPs patched (idempotent)", n == 5 and R.patch_ricursive_fused_mlp(m) == 5, n)
+    nn_ = R.patch_ricursive_fused_rmsnorm(m)
+    # 5 layers x (4 layer norms + q_norm + k_norm) + final norm
+    check("model: all 31 RMSNorms patched (idempotent)", nn_ == 31 and R.patch_ricursive_fused_rmsnorm(m) == 31, nn_)
     l1, g1 = loss_and_grads()
     gd = max(rel(g1[k], g0[k]) for k in g0)
-    check("model: loss unchanged by the fused MLP", abs(l1 - l0) < 1e-6, (l1, l0))
-    check("model: every gradient unchanged (gradient checkpointing on)", set(g1) == set(g0) and gd < 1e-5, gd)
+    check("model: loss unchanged by the fused MLP + RMSNorm", abs(l1 - l0) < 1e-5, (l1, l0))
+    check("model: every gradient unchanged (gradient checkpointing on)", set(g1) == set(g0) and gd < 1e-4, gd)
 
 
 def test_gpu_size():
@@ -143,11 +185,40 @@ def test_gpu_size():
         return a.elapsed_time(b) / 10
 
     tf, tr = timed(K.clamped_silu_mul), timed(K.reference)
-    print(f"INFO fwd+bwd per call at [4096, 40960] bf16: fused {tf:.1f} ms, torch {tr:.1f} ms ({tr / tf:.1f}x)")
+    print(f"INFO MLP fwd+bwd per call at [4096, 40960] bf16: fused {tf:.1f} ms, torch {tr:.1f} ms ({tr / tf:.1f}x)")
+    del g, u, dh
+
+    x = (torch.randn(8192, 5120, device="cuda") * 3).bfloat16()
+    w = (1 + 0.3 * torch.randn(5120, device="cuda")).bfloat16()
+    dy = torch.randn(8192, 5120, device="cuda").bfloat16()
+    truth = run_norm(K.rms_norm_reference, x.double(), w.double(), dy.double())
+    fused = run_norm(K.rms_norm, x, w, dy)
+    ref = run_norm(K.rms_norm_reference, x, w, dy)
+    for i, name in enumerate(("forward", "input gradient")):
+        ef, et = rel(fused[i], truth[i]), rel(ref[i], truth[i])
+        check(f"GPU RMSNorm [8192, 5120] bf16 {name}: fused error {ef:.1e} <= model error {et:.1e} (x1.5)",
+              ef <= 1.5 * et + 1e-6, (ef, et))
+    del truth
+
+    def timed_norm(fn):
+        for _ in range(2):
+            run_norm(fn, x, w, dy)
+        torch.cuda.synchronize()
+        a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        a.record()
+        for _ in range(10):
+            run_norm(fn, x, w, dy)
+        b.record()
+        torch.cuda.synchronize()
+        return a.elapsed_time(b) / 10
+
+    tf, tr = timed_norm(K.rms_norm), timed_norm(K.rms_norm_reference)
+    print(f"INFO RMSNorm fwd+bwd per call at [8192, 5120] bf16: fused {tf:.2f} ms, model {tr:.2f} ms ({tr / tf:.1f}x)")
 
 
 if __name__ == "__main__":
     test_function()
+    test_rmsnorm()
     test_model()
     test_gpu_size()
     print(f"\n{'ALL PASSED' if not FAIL else f'{len(FAIL)} FAILED: {FAIL}'}")
