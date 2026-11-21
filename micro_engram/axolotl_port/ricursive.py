@@ -252,6 +252,36 @@ def patch_ricursive_chunked_loss(model, chunk=1024):
     return False
 
 
+# ----------------------------------------------------------------------------- fused MLP activation
+def patch_ricursive_fused_mlp(model):
+    """``RicursiveMLP._forward_rows``: the projections stay module calls (LoRA / bnb / FSDP hooks),
+    the clamp -> silu -> mul between them runs as one fused Triton kernel forward and backward
+    (ricursive_kernels.clamped_silu_mul; plain torch ops where Triton can't run). Returns the
+    number of MLP modules patched (idempotent)."""
+    from .ricursive_kernels import clamped_silu_mul
+
+    cls, n = None, 0
+    for mod in model.modules():
+        if type(mod).__name__ == "RicursiveMLP":
+            cls = type(mod)
+            n += 1
+    if cls is None:
+        return 0
+    if getattr(cls._forward_rows, "_me_fused", False):
+        return n
+    orig = cls._forward_rows
+
+    def _forward_rows(self, x):
+        gate = self.gate_proj(x)
+        up = self.up_proj(x)
+        return self.down_proj(clamped_silu_mul(gate, up, self.clamp_threshold))
+
+    _forward_rows._me_fused = True
+    _forward_rows._me_original = orig
+    cls._forward_rows = _forward_rows
+    return n
+
+
 def patch_ricursive_varlen(model):
     """Patch the Ricursive classes found on ``model`` (idempotent). Returns the number of attention
     modules now on the varlen path (0: not a Ricursive model)."""

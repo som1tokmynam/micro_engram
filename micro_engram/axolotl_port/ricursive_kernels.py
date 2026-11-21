@@ -1,0 +1,108 @@
+"""Fused clamped-SwiGLU activation for the Ricursive MLP: ``silu(min(g, T)) * clamp(u, -T, T)``.
+
+The model computes it as separate bf16 ops (clamp, clamp, silu, mul) on [tokens, 40960]
+tensors, and autograd adds as many again in backward; under gradient checkpointing the forward
+runs twice. Here one Triton kernel does the forward (fp32 math, one bf16 write) and saves only
+``g`` and ``u``; one kernel does the backward (recomputes from them, writes dg and du). Gradient
+masks follow torch's clamp backward, which is strict (``g < T``; ``-T < u < T``: no gradient
+exactly at the threshold). No clamp threshold -> T = inf.
+
+``clamped_silu_mul`` falls back to the plain torch ops when Triton can't run (no CUDA and no
+``TRITON_INTERPRET=1``) or the tensor is too large for int32 offsets.
+"""
+from __future__ import annotations
+
+import math
+import os
+
+import torch
+import torch.nn.functional as F
+
+_BLOCK = 1024
+
+try:  # pragma: no cover - import guarded for machines without Triton
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _fwd_kernel(g_ptr, u_ptr, h_ptr, n, T, BLOCK: tl.constexpr):
+        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        m = offs < n
+        g = tl.load(g_ptr + offs, mask=m, other=0.0).to(tl.float32)
+        u = tl.load(u_ptr + offs, mask=m, other=0.0).to(tl.float32)
+        gc = tl.minimum(g, T)
+        uc = tl.minimum(tl.maximum(u, -T), T)
+        s = 1.0 / (1.0 + tl.exp(-gc))
+        h = gc * s * uc
+        tl.store(h_ptr + offs, h.to(h_ptr.dtype.element_ty), mask=m)
+
+    @triton.jit
+    def _bwd_kernel(dh_ptr, g_ptr, u_ptr, dg_ptr, du_ptr, n, T, BLOCK: tl.constexpr):
+        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        m = offs < n
+        dh = tl.load(dh_ptr + offs, mask=m, other=0.0).to(tl.float32)
+        g = tl.load(g_ptr + offs, mask=m, other=0.0).to(tl.float32)
+        u = tl.load(u_ptr + offs, mask=m, other=0.0).to(tl.float32)
+        gc = tl.minimum(g, T)
+        uc = tl.minimum(tl.maximum(u, -T), T)
+        s = 1.0 / (1.0 + tl.exp(-gc))
+        silu = gc * s
+        dsilu = s * (1.0 + gc * (1.0 - s))
+        # torch's clamp backward is strict: no gradient exactly at the threshold
+        dg = tl.where(g < T, dh * uc * dsilu, 0.0)
+        du = tl.where((u > -T) & (u < T), dh * silu, 0.0)
+        tl.store(dg_ptr + offs, dg.to(dg_ptr.dtype.element_ty), mask=m)
+        tl.store(du_ptr + offs, du.to(du_ptr.dtype.element_ty), mask=m)
+
+    _HAVE_TRITON = True
+except Exception:  # noqa: BLE001
+    _HAVE_TRITON = False
+
+
+def _grid(n):
+    return ((n + _BLOCK - 1) // _BLOCK,)
+
+
+class _ClampedSiluMul(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, g, u, T):
+        g = g.contiguous()
+        u = u.to(g.dtype).contiguous()
+        h = torch.empty_like(g)
+        n = g.numel()
+        _fwd_kernel[_grid(n)](g, u, h, n, T, BLOCK=_BLOCK)
+        ctx.save_for_backward(g, u)
+        ctx.T = T
+        return h
+
+    @staticmethod
+    def backward(ctx, dh):
+        g, u = ctx.saved_tensors
+        dh = dh.contiguous()
+        dg = torch.empty_like(g)
+        du = torch.empty_like(u)
+        n = g.numel()
+        _bwd_kernel[_grid(n)](dh, g, u, dg, du, n, ctx.T, BLOCK=_BLOCK)
+        return dg, du, None
+
+
+def reference(g, u, threshold):
+    """The model's own ops (RicursiveMLP._forward_rows between the projections)."""
+    if threshold:
+        g = g.clamp(min=None, max=threshold)
+        u = u.clamp(min=-threshold, max=threshold)
+    return F.silu(g) * u
+
+
+def fused_available(t):
+    if not _HAVE_TRITON or t.numel() >= 2**31 - _BLOCK:
+        return False
+    return t.is_cuda or os.environ.get("TRITON_INTERPRET") == "1"
+
+
+def clamped_silu_mul(g, u, threshold):
+    """``silu(min(g, T)) * clamp(u, -T, T)`` (no clamp when threshold is falsy); fused when possible."""
+    if not fused_available(g) or g.shape != u.shape:
+        return reference(g, u, threshold)
+    T = float(threshold) if threshold else math.inf
+    return _ClampedSiluMul.apply(g, u, T)

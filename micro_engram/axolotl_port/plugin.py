@@ -69,6 +69,10 @@ class QLoRAPortPlugin(BasePlugin):
             chunk = 1024 if chunk is None else int(chunk)
             if chunk > 0 and ricursive.patch_ricursive_chunked_loss(model, chunk):
                 done.append(f"ricursive: training loss in {chunk}-token chunks (no full logits)")
+            if _on(cfg, "qlora_port_ricursive_fused_mlp"):
+                n = ricursive.patch_ricursive_fused_mlp(model)
+                if n:
+                    done.append(f"ricursive: fused clamp-SiLU-mul in {n} MLPs")
         if not cfg.get("gemma4_hybrid_attn_impl"):
             if (_on(cfg, "qlora_port_dynamic_packing") or _on(cfg, "qlora_port_unmask_global_layers")) \
                     and not _is_ricursive(model):

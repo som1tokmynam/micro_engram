@@ -23,3 +23,5 @@ class QLoRAPortArgs(BaseModel):
     qlora_port_ricursive_varlen: Optional[bool] = True
     # Ricursive: training loss over chunks of this many tokens (no full [S, vocab] logits). 0 = off.
     qlora_port_ricursive_loss_chunk: Optional[int] = 1024
+    # Ricursive: clamp -> silu -> mul of the MLP as one fused Triton kernel (fwd + bwd).
+    qlora_port_ricursive_fused_mlp: Optional[bool] = True

@@ -121,6 +121,23 @@ instead, about 1 GB at most.
 The CPU test checks the loss value and every gradient (lm_head included) against the full-logits
 loss, and that `lm_head` never sees more than one chunk.
 
+**Fused MLP activation** (`qlora_port_ricursive_fused_mlp`, default on): the model computes
+`silu(gate.clamp(max=T)) * up.clamp(-T, T)` as separate bf16 ops on `[tokens, 40960]` tensors. That
+elementwise work was ~30% of compute in the step profile.
+- One Triton kernel now does the forward in fp32 and writes once; one kernel does the backward.
+- Only `gate` and `up` are saved for backward.
+- The clamp masks match torch's clamp backward, which gives no gradient exactly at ±T.
+- The projections stay module calls (LoRA / bnb / FSDP).
+- Without CUDA or Triton, the original ops run.
+
+`python test_ricursive_mlp.py`:
+- **CPU:** runs the kernels through Triton's interpreter. Forward and both gradients match the
+  model's ops (fp32, clamps binding, no-clamp case). With `RICURSIVE_MODEL_DIR` it also checks
+  that loss and every gradient of a tiny model are unchanged (with gradient checkpointing).
+- **GPU:** checks bf16 at `[4096, 40960]` (fused error at most 1.5× torch's own bf16 error,
+  against fp32) and prints fwd+bwd timing. The interpreter truncates on bf16 stores, so the CPU
+  bf16 bound is looser.
+
 ## Use
 
 Install this repo in the Axolotl venv (`pip install -e /path/to/micro_engram`), then add to the
